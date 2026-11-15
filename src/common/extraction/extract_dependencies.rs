@@ -208,10 +208,14 @@ fn collect_internal_aliases(
 ) -> AliasMap {
     let mut aliases = AliasMap::new();
     for reference in references {
-        if !matches!(
-            reference.kind,
-            ImportKind::Use | ImportKind::PubUse | ImportKind::Mod
-        ) {
+        let self_crate_alias =
+            reference.kind == ImportKind::ExternCrate && reference.segments == ["self"];
+        if !self_crate_alias
+            && !matches!(
+                reference.kind,
+                ImportKind::Use | ImportKind::PubUse | ImportKind::Mod
+            )
+        {
             continue;
         }
         let Some(binding) = &reference.binding else {
@@ -262,6 +266,12 @@ fn resolve_direct(
             if let Some(found) =
                 longest_prefix(index, &reference.module, &reference.segments[1..], 0)
             {
+                candidates.insert(found);
+            }
+        }
+        // Unlike a `self::` path, `extern crate self` names this target's crate root.
+        "self" if reference.kind == ImportKind::ExternCrate => {
+            if let Some(found) = longest_prefix(index, &reference.module, &[], 0) {
                 candidates.insert(found);
             }
         }
@@ -416,10 +426,36 @@ mod tests {
                 module("lib", &["consumer", "local"]),
                 "src/consumer/local.rs",
             ),
+            (module("lib", &["sibling"]), "src/sibling.rs"),
         ]
         .into_iter()
         .map(|(module, source)| (module, source.to_owned()))
         .collect()
+    }
+
+    fn alias(current: LogicalModule, binding: &str) -> RawReference {
+        let mut declaration = reference(current, &["self"]);
+        declaration.kind = ImportKind::ExternCrate;
+        declaration.binding = Some(binding.to_owned());
+        declaration
+    }
+
+    fn use_alias(current: LogicalModule, segments: &[&str], binding: &str) -> RawReference {
+        let mut reference = reference(current, segments);
+        reference.kind = ImportKind::Use;
+        reference.binding = Some(binding.to_owned());
+        reference
+    }
+
+    fn assert_alias_target(reference: &RawReference, aliases: &AliasMap, expected: &str) {
+        let ResolutionOutcome::Found(found) = resolve_reference(reference, &index(), aliases)
+        else {
+            panic!(
+                "expected {expected} for {}, got no unique target",
+                reference.rendered_path()
+            );
+        };
+        assert_eq!(found.source, expected);
     }
 
     #[test]
@@ -455,52 +491,163 @@ mod tests {
     }
 
     #[test]
-    fn resolves_paths_through_internal_use_aliases() {
+    fn resolves_paths_through_internal_aliases() {
         let current = module("lib", &["consumer"]);
-        let import = RawReference {
-            source: "src/consumer.rs".to_owned(),
-            module: current.clone(),
-            segments: vec!["crate".to_owned(), "api".to_owned()],
-            leading_colon: false,
-            kind: ImportKind::Use,
-            line: 1,
-            binding: Some("public_api".to_owned()),
-            declaration: None,
-            ignored: false,
-        };
-        let aliases = collect_internal_aliases(&[import], &index());
-        let reference = reference(current, &["public_api", "model", "User"]);
+        let crate_api = use_alias(current.clone(), &["crate", "api"], "public_api");
 
-        let ResolutionOutcome::Found(found) = resolve_reference(&reference, &index(), &aliases)
-        else {
-            panic!("fixture alias should resolve uniquely");
-        };
+        for (declaration, binding, segments, expected) in [
+            (
+                crate_api,
+                "public_api",
+                &["public_api", "model", "User"][..],
+                "src/api/model.rs",
+            ),
+            (
+                alias(current.clone(), "this_crate"),
+                "this_crate",
+                &["this_crate", "api", "model", "User"][..],
+                "src/api/model.rs",
+            ),
+        ] {
+            let aliases = collect_internal_aliases(&[declaration], &index());
+            let reference = reference(current.clone(), segments);
 
-        assert_eq!(found.source, "src/api/model.rs");
+            let ResolutionOutcome::Found(found) = resolve_reference(&reference, &index(), &aliases)
+            else {
+                panic!("fixture alias {binding} should resolve uniquely");
+            };
+
+            assert_eq!(found.source, expected, "wrong target for alias {binding}");
+        }
     }
 
     #[test]
     fn explicit_bindings_take_precedence_over_bare_module_candidates() {
         let current = module("lib", &["consumer"]);
-        let import = RawReference {
-            source: "src/consumer.rs".to_owned(),
-            module: current.clone(),
-            segments: vec!["crate".to_owned(), "api".to_owned()],
-            leading_colon: false,
-            kind: ImportKind::Use,
-            line: 1,
-            binding: Some("local".to_owned()),
-            declaration: None,
-            ignored: false,
-        };
-        let aliases = collect_internal_aliases(&[import], &index());
-        let reference = reference(current, &["local", "Thing"]);
+        let crate_api = use_alias(current.clone(), &["crate", "api"], "local");
 
-        let ResolutionOutcome::Found(found) = resolve_reference(&reference, &index(), &aliases)
-        else {
-            panic!("the explicit local binding should win");
-        };
+        for (declaration, binding, segments, expected) in [
+            (crate_api, "local", &["local", "Thing"][..], "src/api.rs"),
+            (
+                alias(current.clone(), "api"),
+                "api",
+                &["api", "Risk"][..],
+                "src/lib.rs",
+            ),
+        ] {
+            let aliases = collect_internal_aliases(&[declaration], &index());
+            let reference = reference(current.clone(), segments);
 
-        assert_eq!(found.source, "src/api.rs");
+            let ResolutionOutcome::Found(found) = resolve_reference(&reference, &index(), &aliases)
+            else {
+                panic!("the explicit {binding} binding should win");
+            };
+
+            assert_eq!(found.source, expected, "wrong precedence for {binding}");
+        }
+    }
+
+    #[test]
+    fn root_self_crate_alias_resolves_root_reexport() {
+        let root = module("lib", &[]);
+        let aliases = collect_internal_aliases(&[alias(root.clone(), "this_crate")], &index());
+
+        assert_alias_target(
+            &reference(root, &["this_crate", "Risk"]),
+            &aliases,
+            "src/lib.rs",
+        );
+    }
+
+    #[test]
+    fn self_crate_aliases_respect_competing_library_and_binary_roots() {
+        let targets = [
+            ("lib", "src/lib.rs", "src/consumer.rs"),
+            ("bin", "src/main.rs", "src/bin_consumer.rs"),
+        ];
+        let mut index = BTreeMap::new();
+        let mut declarations = Vec::new();
+        for (target, root, consumer) in targets {
+            index.insert(module(target, &[]), root.to_owned());
+
+            let mut declaration = alias(module(target, &["consumer"]), "local_crate");
+            declaration.source = consumer.to_owned();
+            index.insert(declaration.module.clone(), consumer.to_owned());
+            declarations.push(declaration);
+        }
+        let mut library_only = declarations[0].clone();
+        library_only.binding = Some("library_only".to_owned());
+        let mut aliases = collect_internal_aliases(&declarations, &index);
+        aliases.extend(collect_internal_aliases(&[library_only], &index));
+
+        for (declaration, (target, root, _)) in declarations.iter().zip(targets) {
+            let mut qualified = declaration.clone();
+            qualified.kind = ImportKind::PathReference;
+            qualified.binding = None;
+            qualified.segments = vec!["local_crate".to_owned(), "Item".to_owned()];
+            for reference in [declaration, &qualified] {
+                let ResolutionOutcome::Found(found) =
+                    resolve_reference(reference, &index, &aliases)
+                else {
+                    panic!(
+                        "expected {} to resolve in target {target}",
+                        reference.rendered_path(),
+                    );
+                };
+                assert_eq!(found.source, root, "wrong root for target {target}");
+            }
+
+            qualified.segments[0] = "library_only".to_owned();
+            let outcome = resolve_reference(&qualified, &index, &aliases);
+            if target == "lib" {
+                assert!(
+                    matches!(outcome, ResolutionOutcome::Found(found) if found.source == root),
+                    "the library-only alias should resolve inside lib",
+                );
+            } else {
+                assert!(
+                    matches!(outcome, ResolutionOutcome::Unresolved),
+                    "a library-only alias must not leak into the bin target",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn use_via_renamed_self_crate_alias_resolves_root() {
+        let current = module("lib", &["consumer"]);
+        let aliases =
+            collect_internal_aliases(&[alias(current.clone(), "renamed_crate")], &index());
+        let import = use_alias(current, &["renamed_crate", "Risk"], "RenamedRisk");
+
+        assert_alias_target(&import, &aliases, "src/lib.rs");
+    }
+
+    #[test]
+    fn other_extern_crates_do_not_become_internal_aliases() {
+        let mut declaration = reference(module("lib", &["consumer"]), &["api"]);
+        declaration.kind = ImportKind::ExternCrate;
+        declaration.binding = Some("other_crate".to_owned());
+
+        let aliases = collect_internal_aliases(&[declaration], &index());
+
+        assert!(aliases.is_empty());
+    }
+
+    #[test]
+    fn nested_alias_does_not_leak_into_sibling_module() {
+        let aliases = collect_internal_aliases(
+            &[alias(module("lib", &["consumer"]), "this_crate")],
+            &index(),
+        );
+
+        assert!(matches!(
+            resolve_reference(
+                &reference(module("lib", &["sibling"]), &["this_crate", "Risk"]),
+                &index(),
+                &aliases,
+            ),
+            ResolutionOutcome::Unresolved
+        ));
     }
 }

@@ -2,7 +2,7 @@ use std::{collections::BTreeSet, path::PathBuf};
 
 use archunit::{
     Edge, ExtractionDiagnosticKind, ImportKind, ProjectLocator, SourceOptions,
-    enumerate_source_files, extract_graph, locate_project_from,
+    enumerate_source_files, extract_dependencies, extract_graph, locate_project_from,
 };
 
 fn fixture_project() -> archunit::CargoProject {
@@ -10,6 +10,13 @@ fn fixture_project() -> archunit::CargoProject {
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/extraction_workspace");
     locate_project_from(&ProjectLocator::from_path(fixture))
         .expect("fixture workspace should be discoverable")
+}
+
+fn self_crate_alias_project() -> archunit::CargoProject {
+    let fixture =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/self_crate_alias_project");
+    locate_project_from(&ProjectLocator::from_path(fixture))
+        .expect("self-crate alias fixture should be discoverable")
 }
 
 #[test]
@@ -134,4 +141,73 @@ fn development_sources_receive_self_edges_only_when_selected() {
             .count()
             + 3
     );
+}
+
+#[test]
+fn nested_self_crate_alias_resolves_source_references_and_graph_edges() {
+    let project = self_crate_alias_project();
+    let dependencies = extract_dependencies(&project, SourceOptions::default())
+        .expect("self-crate alias dependencies should extract");
+
+    for (path, target, kind, count) in [
+        ("self", "src/lib.rs", ImportKind::ExternCrate, 1),
+        (
+            "local_crate::Item",
+            "src/lib.rs",
+            ImportKind::PathReference,
+            2,
+        ),
+        (
+            "local_crate::api::Model",
+            "src/api.rs",
+            ImportKind::PathReference,
+            1,
+        ),
+    ] {
+        let references = dependencies
+            .references()
+            .iter()
+            .filter(|reference| {
+                reference.source() == "src/consumer.rs"
+                    && reference.referenced_path() == path
+                    && reference.kind() == kind
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            references.len(),
+            count,
+            "expected {count} {kind:?} references to {path}",
+        );
+        for reference in references {
+            assert_eq!(
+                reference.internal_target(),
+                Some(target),
+                "{path} at line {} should resolve to {target}",
+                reference.line(),
+            );
+        }
+    }
+
+    let graph = extract_graph(&project, SourceOptions::default())
+        .expect("self-crate alias graph should extract");
+    assert!(
+        graph.diagnostics().is_empty(),
+        "unexpected extraction diagnostics: {:?}",
+        graph.diagnostics(),
+    );
+    for (target, kinds) in [
+        (
+            "src/lib.rs",
+            vec![ImportKind::ExternCrate, ImportKind::PathReference],
+        ),
+        ("src/api.rs", vec![ImportKind::PathReference]),
+    ] {
+        let edge = graph
+            .graph()
+            .iter()
+            .find(|edge| edge.source == "src/consumer.rs" && edge.target == target)
+            .unwrap_or_else(|| panic!("expected consumer-to-{target} edge"));
+        assert!(!edge.external);
+        assert_eq!(edge.import_kinds.iter().collect::<Vec<_>>(), kinds);
+    }
 }
